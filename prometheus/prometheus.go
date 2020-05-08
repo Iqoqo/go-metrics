@@ -5,15 +5,16 @@ package prometheus
 import (
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
-	"regexp"
-
 	"github.com/armon/go-metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/push"
+
+	"bitbucket.org/avd/go-ipc/mq"
 )
 
 var (
@@ -203,8 +204,10 @@ type PrometheusPushSink struct {
 	stopChan     chan struct{}
 }
 
-func NewPrometheusPushSink(address string, pushIterval time.Duration, name string) (*PrometheusPushSink, error) {
-
+func NewPrometheusPushSink(address string, pushIterval time.Duration, name string, jwtEnabled bool, mqName string, mqRefreshTime time.Duration) (*PrometheusPushSink, error) {
+	if jwtEnabled && mqName != "" && mqRefreshTime > 0 {
+		go mqJWTToken(mqName, mqRefreshTime)
+	}
 	promSink := &PrometheusSink{
 		gauges:     make(map[string]prometheus.Gauge),
 		summaries:  make(map[string]prometheus.Summary),
@@ -248,4 +251,26 @@ func (s *PrometheusPushSink) flushMetrics() {
 
 func (s *PrometheusPushSink) Shutdown() {
 	close(s.stopChan)
+}
+
+func mqJWTToken(mqName string, mqRefreshTime time.Duration) {
+	mq, err := mq.Open(mqName, 0)
+	if err != nil {
+		fmt.Println("mqJWTToken: cannot open mq (error", err.Error(), ")")
+		return
+	}
+	defer mq.Close()
+
+	received := make([]byte, 1)
+
+	for true {
+		_, err = mq.Receive(received)
+		if err != nil {
+			fmt.Println("mqJWTToken: cannot recieve message (error", err.Error(), ")")
+			return
+		}
+		fmt.Print("received: ")
+		fmt.Println(received)
+		// time.Sleep(mqRefreshTime)
+	}
 }
