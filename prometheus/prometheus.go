@@ -3,17 +3,25 @@
 package prometheus
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
-	"regexp"
-
 	"github.com/armon/go-metrics"
+	"github.com/dgrijalva/jwt-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/push"
+
+	"bitbucket.org/avd/go-ipc/mq"
+)
+
+const (
+	MaxJwtTokenSize = 4096
+	OpCodeToken     = 0x1
 )
 
 var (
@@ -203,8 +211,10 @@ type PrometheusPushSink struct {
 	stopChan     chan struct{}
 }
 
-func NewPrometheusPushSink(address string, pushIterval time.Duration, name string) (*PrometheusPushSink, error) {
-
+func NewPrometheusPushSink(address string, pushIterval time.Duration, name string, jwtEnabled bool, mqName string, mqRefreshTime time.Duration) (*PrometheusPushSink, error) {
+	if jwtEnabled && mqName != "" && mqRefreshTime > 0 {
+		go mqJWTToken(mqName, mqRefreshTime)
+	}
 	promSink := &PrometheusSink{
 		gauges:     make(map[string]prometheus.Gauge),
 		summaries:  make(map[string]prometheus.Summary),
@@ -248,4 +258,55 @@ func (s *PrometheusPushSink) flushMetrics() {
 
 func (s *PrometheusPushSink) Shutdown() {
 	close(s.stopChan)
+}
+
+func mqJWTToken(mqName string, mqRefreshTime time.Duration) {
+	mq, err := mq.Open(mqName, 0)
+	if err != nil {
+		fmt.Println("mqJWTToken: cannot open mq (error", err.Error(), ")")
+		return
+	}
+	defer mq.Close()
+
+	receivedData := make([]byte, MaxJwtTokenSize)
+
+	for true {
+		_, err = mq.Receive(receivedData)
+		if err != nil {
+			fmt.Println("mqJWTToken: cannot recieve message (error", err.Error(), ")")
+			continue
+		}
+
+		opCode := receivedData[0]
+
+		if opCode == OpCodeToken {
+			tokenSizeBytes := make([]byte, 4)
+			for i := 0; i < 4; i++ {
+				tokenSizeBytes[i] = receivedData[i+1]
+			}
+			tokenSize := int(binary.LittleEndian.Uint32(tokenSizeBytes))
+
+			if tokenSize > MaxJwtTokenSize {
+				continue
+			}
+
+			tokenString := make([]byte, tokenSize)
+			for i := 0; i < tokenSize; i++ {
+				tokenString[i] = receivedData[i+5]
+			}
+
+			token, _, err1 := new(jwt.Parser).ParseUnverified(string(tokenString), jwt.MapClaims{})
+
+			if err1 != nil {
+				fmt.Println(err1)
+				continue
+			}
+
+			if claims, ok := token.Claims.(jwt.MapClaims); ok {
+				fmt.Println("token", claims["exp"], claims["username"])
+			} else {
+				fmt.Println(err1)
+			}
+		}
+	}
 }
