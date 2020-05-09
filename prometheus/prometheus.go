@@ -3,6 +3,7 @@
 package prometheus
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
 	"regexp"
@@ -11,10 +12,16 @@ import (
 	"time"
 
 	"github.com/armon/go-metrics"
+	"github.com/dgrijalva/jwt-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/push"
 
 	"bitbucket.org/avd/go-ipc/mq"
+)
+
+const (
+	MaxJwtTokenSize = 4096
+	OpCodeToken     = 0x1
 )
 
 var (
@@ -261,16 +268,45 @@ func mqJWTToken(mqName string, mqRefreshTime time.Duration) {
 	}
 	defer mq.Close()
 
-	received := make([]byte, 1)
+	receivedData := make([]byte, MaxJwtTokenSize)
 
 	for true {
-		_, err = mq.Receive(received)
+		_, err = mq.Receive(receivedData)
 		if err != nil {
 			fmt.Println("mqJWTToken: cannot recieve message (error", err.Error(), ")")
-			return
+			continue
 		}
-		fmt.Print("received: ")
-		fmt.Println(received)
-		// time.Sleep(mqRefreshTime)
+
+		opCode := receivedData[0]
+
+		if opCode == OpCodeToken {
+			tokenSizeBytes := make([]byte, 4)
+			for i := 0; i < 4; i++ {
+				tokenSizeBytes[i] = receivedData[i+1]
+			}
+			tokenSize := int(binary.LittleEndian.Uint32(tokenSizeBytes))
+
+			if tokenSize > MaxJwtTokenSize {
+				continue
+			}
+
+			tokenString := make([]byte, tokenSize)
+			for i := 0; i < tokenSize; i++ {
+				tokenString[i] = receivedData[i+5]
+			}
+
+			token, _, err1 := new(jwt.Parser).ParseUnverified(string(tokenString), jwt.MapClaims{})
+
+			if err1 != nil {
+				fmt.Println(err1)
+				continue
+			}
+
+			if claims, ok := token.Claims.(jwt.MapClaims); ok {
+				fmt.Println("token", claims["exp"], claims["username"])
+			} else {
+				fmt.Println(err1)
+			}
+		}
 	}
 }
