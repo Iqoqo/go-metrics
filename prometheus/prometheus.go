@@ -3,25 +3,17 @@
 package prometheus
 
 import (
-	"encoding/binary"
 	"fmt"
 	"log"
+	"net/http"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/armon/go-metrics"
-	"github.com/dgrijalva/jwt-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/push"
-
-	"bitbucket.org/avd/go-ipc/mq"
-)
-
-const (
-	MaxJwtTokenSize = 4096
-	OpCodeToken     = 0x1
 )
 
 var (
@@ -209,12 +201,12 @@ type PrometheusPushSink struct {
 	address      string
 	pushInterval time.Duration
 	stopChan     chan struct{}
+	jwtEnabled   bool
+	accessToken  string
+	refreshToken string
 }
 
-func NewPrometheusPushSink(address string, pushIterval time.Duration, name string, jwtEnabled bool, mqName string, mqRefreshTime time.Duration) (*PrometheusPushSink, error) {
-	if jwtEnabled && mqName != "" && mqRefreshTime > 0 {
-		go mqJWTToken(mqName, mqRefreshTime)
-	}
+func NewPrometheusPushSink(address string, pushIterval time.Duration, name string, jwtEnabled bool, accessToken string, refreshToken string) (*PrometheusPushSink, error) {
 	promSink := &PrometheusSink{
 		gauges:     make(map[string]prometheus.Gauge),
 		summaries:  make(map[string]prometheus.Summary),
@@ -231,10 +223,35 @@ func NewPrometheusPushSink(address string, pushIterval time.Duration, name strin
 		address,
 		pushIterval,
 		make(chan struct{}),
+		jwtEnabled,
+		accessToken,
+		refreshToken,
 	}
 
 	sink.flushMetrics()
 	return sink, nil
+}
+
+func (s *PrometheusPushSink) isJwtTokenValid(tokenString string) bool {
+	// TODO: The finish the verification of the token expiary time and return true or
+	// false accordingly. As we don't have the key to decode the token therefor
+	// solution below may be bases on using ParseUnverified and checking the difference
+	// between iat (issued at time) and exp (expiration time)
+
+	//isValid := false
+	//token, _, err := new(jwt.Parser).ParseUnverified(tokenString, jwt.MapClaims{})
+
+	//if err != nil {
+	//		fmt.Println("ParseUnverified error:", err.Error())
+	//		return false
+	//	}
+	//
+	//	claims, ok := token.Claims.(jwt.MapClaims)
+	//	if ok && token.Valid {
+	//		isValid = true
+	//	}
+
+	return true
 }
 
 func (s *PrometheusPushSink) flushMetrics() {
@@ -244,9 +261,31 @@ func (s *PrometheusPushSink) flushMetrics() {
 		for {
 			select {
 			case <-ticker.C:
-				err := s.pusher.Push()
-				if err != nil {
-					log.Printf("[ERR] Error pushing to Prometheus! Err: %s", err)
+				if s.jwtEnabled {
+					// new code: adding verification of the token
+					if isValid := s.isJwtTokenValid(s.accessToken); isValid {
+						s.pusher.SetJwtEnable(true)
+						s.pusher.SetJwtToken(s.accessToken)
+
+						statusCode, err := s.pusher.PushWithToken()
+						if statusCode == http.StatusUnauthorized {
+							// TODO renew Access Token
+						}
+
+						if err != nil {
+							log.Printf("[ERR] Error pushing to Prometheus! Err: %s", err)
+						}
+					} else {
+						// TODO: if Token has expired get the new access token from the
+						// auth server using refresh token
+						fmt.Println("token is invalid")
+					}
+				} else {
+					err := s.pusher.Push()
+
+					if err != nil {
+						log.Printf("[ERR] Error pushing to Prometheus! Err: %s", err)
+					}
 				}
 			case <-s.stopChan:
 				ticker.Stop()
@@ -258,55 +297,4 @@ func (s *PrometheusPushSink) flushMetrics() {
 
 func (s *PrometheusPushSink) Shutdown() {
 	close(s.stopChan)
-}
-
-func mqJWTToken(mqName string, mqRefreshTime time.Duration) {
-	mq, err := mq.Open(mqName, 0)
-	if err != nil {
-		fmt.Println("mqJWTToken: cannot open mq (error", err.Error(), ")")
-		return
-	}
-	defer mq.Close()
-
-	receivedData := make([]byte, MaxJwtTokenSize)
-
-	for true {
-		_, err = mq.Receive(receivedData)
-		if err != nil {
-			fmt.Println("mqJWTToken: cannot recieve message (error", err.Error(), ")")
-			continue
-		}
-
-		opCode := receivedData[0]
-
-		if opCode == OpCodeToken {
-			tokenSizeBytes := make([]byte, 4)
-			for i := 0; i < 4; i++ {
-				tokenSizeBytes[i] = receivedData[i+1]
-			}
-			tokenSize := int(binary.LittleEndian.Uint32(tokenSizeBytes))
-
-			if tokenSize > MaxJwtTokenSize {
-				continue
-			}
-
-			tokenString := make([]byte, tokenSize)
-			for i := 0; i < tokenSize; i++ {
-				tokenString[i] = receivedData[i+5]
-			}
-
-			token, _, err1 := new(jwt.Parser).ParseUnverified(string(tokenString), jwt.MapClaims{})
-
-			if err1 != nil {
-				fmt.Println(err1)
-				continue
-			}
-
-			if claims, ok := token.Claims.(jwt.MapClaims); ok {
-				fmt.Println("token", claims["exp"], claims["username"])
-			} else {
-				fmt.Println(err1)
-			}
-		}
-	}
 }
